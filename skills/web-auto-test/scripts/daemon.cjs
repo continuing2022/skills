@@ -72,6 +72,20 @@ function parseViewport(spec) {
   };
 }
 
+const sensitiveInputSelector = [
+  'input[type="password"]', '[autocomplete~="username"]', '[autocomplete~="current-password"]',
+  '[autocomplete~="new-password"]', '[autocomplete~="one-time-code"]',
+  '[autocomplete~="cc-number"]', '[autocomplete~="cc-csc"]', '[data-webtest-private]'
+].join(', ');
+const screenshotMaskSelector = `${sensitiveInputSelector}, [data-webtest-mask]`;
+const finalCaseStatuses = new Set(['pass', 'fail', 'blocked', 'skipped']);
+const changeStatuses = new Set(['pending', 'restored', 'retained', 'irreversible']);
+// Preserve structured identifiers and artifact links when masking free-form evidence.
+const structureFields = new Set([
+  'action', 'status', 'id', 'caseId', 'screenshot', 'reportPath', 'rawReportPath',
+  'sessionPath', 'outDir', 'startedAt', 'endedAt', 'time'
+]);
+
 function resolveLocator(page, target) {
   const raw = String(target || '').trim();
   if (!raw) throw new Error('Target selector or @ref is required');
@@ -202,10 +216,12 @@ async function main() {
   let activePage = launched.page;
   let shotCounter = 0;
   let activeCase = null;
+  let closingCase = false;
+  const privateValues = new Set();
   const attachedPages = new WeakSet();
 
   const session = {
-    version: 1,
+    version: 2,
     name: sessionName,
     mode: testMode,
     baseUrl: '',
@@ -219,16 +235,61 @@ async function main() {
     summaryNote: '',
     cases: [],
     issues: [],
+    changes: [],
     orphanSteps: [],
     consoleErrors: [],
     networkErrors: []
   };
 
+  function maskEvidence(value) {
+    if (typeof value === 'string') {
+      let masked = value;
+      for (const secret of privateValues) masked = masked.replaceAll(secret, '[已隐藏]');
+      return masked;
+    }
+    if (Array.isArray(value)) return value.map(maskEvidence);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([key, entry]) =>
+        [key, structureFields.has(key) ? entry : maskEvidence(entry)]));
+    }
+    return value;
+  }
+
+  async function enterText(page, body, timeout, type) {
+    const value = String(body.value ?? '');
+    const locator = resolveLocator(page, body.target);
+    let recordValue = false;
+    try {
+      recordValue = await locator.evaluate((el, options) => {
+        const allowed = options.record && !el.matches(options.selector);
+        if (!allowed) el.setAttribute('data-webtest-mask', '');
+        return allowed;
+      }, { record: body.recordValue === true, selector: sensitiveInputSelector }, { timeout });
+      if (!recordValue && value.length >= 4) {
+        const encoded = new URLSearchParams({ value }).toString().slice('value='.length);
+        for (const variant of [value, encoded, encoded.replaceAll('+', '%20')]) {
+          privateValues.add(variant);
+        }
+      }
+      if (type) {
+        await locator.click({ timeout });
+        await locator.pressSequentially(value, { timeout, delay: Number(body.delay ?? 30) });
+      } else {
+        await locator.fill(value, { timeout });
+      }
+    } catch (err) {
+      // Playwright may echo the input in its error and call log.
+      if (!recordValue && value) throw new Error(err.message.replaceAll(value, '[已隐藏]'));
+      throw err;
+    }
+    return recordValue ? { recordValue: true } : {};
+  }
+
   function persistSession() {
     try {
       const targetPath = path.join(outDir, 'session.json');
       const tmpPath = `${targetPath}.tmp`;
-      fs.writeFileSync(tmpPath, JSON.stringify(session, null, 2), 'utf8');
+      fs.writeFileSync(tmpPath, JSON.stringify(maskEvidence(session), null, 2), 'utf8');
       fs.renameSync(tmpPath, targetPath);
     } catch (_) {
       // non-fatal during shutdown
@@ -321,7 +382,11 @@ async function main() {
     const casePrefix = activeCase ? `${sanitizeFilePart(activeCase.id, 'case')}-` : '';
     const filename = `${prefix}-${casePrefix}${sanitizeFilePart(label, 'step')}.png`;
     const filePath = path.join(outDir, 'screenshots', filename);
-    await page.screenshot({ path: filePath, fullPage: Boolean(fullPage) });
+    await page.screenshot({
+      path: filePath,
+      fullPage: Boolean(fullPage),
+      mask: [page.locator(screenshotMaskSelector)]
+    });
     return filePath;
   }
 
@@ -356,7 +421,10 @@ async function main() {
         time: new Date().toISOString(),
         action: actionName,
         target: target || '',
-        value: value || '',
+        value: opts.privateInput && !result.recordValue ? '[已隐藏]' : value || '',
+        ...(result.recordValue ? { recordValue: true } : {}),
+        ...(opts.label ? { label: opts.label } : {}),
+        ...(actionName.startsWith('assert:') ? { actual: result.actual } : {}),
         urlBefore,
         urlAfter,
         durationMs: Date.now() - start,
@@ -378,12 +446,13 @@ async function main() {
         time: new Date().toISOString(),
         action: actionName,
         target: target || '',
-        value: value || '',
+        value: opts.privateInput ? '[已隐藏]' : value || '',
+        ...(opts.label ? { label: opts.label } : {}),
         urlBefore,
         urlAfter,
         durationMs: Date.now() - start,
         ok: false,
-        error: err && err.message ? err.message : String(err),
+        error: maskEvidence(err.message || String(err)),
         screenshot: screenshotPath
       };
       recordStep(step);
@@ -397,12 +466,22 @@ async function main() {
     }
   }
 
+  function finishSession() {
+    session.endedAt ||= new Date().toISOString();
+    if (activeCase && activeCase.status === 'running') {
+      activeCase.status = 'blocked';
+      activeCase.actual = '会话结束时用例还在运行，未收到 case-end 结果';
+      activeCase.endedAt = session.endedAt;
+      activeCase.durationMs = new Date(session.endedAt) - new Date(activeCase.startedAt);
+    }
+    persistSession();
+  }
+
   let shuttingDown = false;
   async function shutdown(server) {
     if (shuttingDown) return;
     shuttingDown = true;
-    session.endedAt = new Date().toISOString();
-    persistSession();
+    finishSession();
     try {
       if (fs.existsSync(stateFile)) fs.unlinkSync(stateFile);
     } catch (_) {}
@@ -422,7 +501,7 @@ async function main() {
   const server = http.createServer(async (req, res) => {
     const send = (statusCode, payload) => {
       res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify(payload));
+      res.end(JSON.stringify(maskEvidence(payload)));
     };
 
     try {
@@ -544,37 +623,15 @@ async function main() {
         return send(out.ok ? 200 : 400, out);
       }
 
-      if (route === '/fill') {
+      if (route === '/fill' || route === '/type') {
+        const action = route.slice(1);
         const timeout = Number(body.timeout || 10000);
-        const value = String(body.value ?? '');
         const out = await runAction(
-          'fill',
+          action,
           body.target,
-          value,
-          async (page) => {
-            const loc = resolveLocator(page, body.target);
-            await loc.fill(value, { timeout });
-            return {};
-          },
-          { screenshot: body.screenshot }
-        );
-        return send(out.ok ? 200 : 400, out);
-      }
-
-      if (route === '/type') {
-        const timeout = Number(body.timeout || 10000);
-        const value = String(body.value ?? '');
-        const out = await runAction(
-          'type',
-          body.target,
-          value,
-          async (page) => {
-            const loc = resolveLocator(page, body.target);
-            await loc.click({ timeout });
-            await loc.pressSequentially(value, { delay: Number(body.delay || 30), timeout });
-            return {};
-          },
-          { screenshot: body.screenshot }
+          String(body.value ?? ''),
+          (page) => enterText(page, body, timeout, action === 'type'),
+          { screenshot: body.screenshot, privateInput: true }
         );
         return send(out.ok ? 200 : 400, out);
       }
@@ -687,7 +744,7 @@ async function main() {
         const out = await runAction(
           `assert:${kind}`,
           body.target || '',
-          body.expected || '',
+          kind === 'value' ? '[已隐藏]' : body.expected || '',
           async (page) => {
             if (kind === 'text') {
               const expected = String(body.expected || '');
@@ -742,13 +799,13 @@ async function main() {
               const actual = await loc.inputValue({ timeout });
               const expected = String(body.expected ?? '');
               if (actual !== expected) {
-                throw new Error(`Expected input value "${expected}", got "${actual}"`);
+                throw new Error('Input value did not match expected value');
               }
-              return { actual };
+              return { actual: 'matched' };
             }
             throw new Error(`Unknown assert kind "${kind}". Use: text, not-text, url, title, visible, hidden, value`);
           },
-          { screenshot: body.screenshot }
+          { screenshot: body.screenshot, label: body.label }
         );
         return send(out.ok ? 200 : 422, out);
       }
@@ -816,17 +873,21 @@ async function main() {
       }
 
       if (route === '/case/start') {
-        // Close any previously running case implicitly as skipped if forgotten
-        if (activeCase && activeCase.status === 'running') {
-          activeCase.status = 'pass';
-          activeCase.endedAt = new Date().toISOString();
-          activeCase.durationMs = Date.now() - new Date(activeCase.startedAt).getTime();
+        if (activeCase) {
+          return send(409, { ok: false, error: `Case "${activeCase.id}" is still active. Run case-end first.` });
         }
-        const id = body.id || `TC-${String(session.cases.length + 1).padStart(2, '0')}`;
+        let id = body.id;
+        if (!id) {
+          let number = session.cases.length + 1;
+          do {
+            id = `TC-${String(number++).padStart(2, '0')}`;
+          } while (session.cases.some((entry) => entry.id === id));
+        }
+        const previous = session.cases.findLast((entry) => entry.id === id);
         const c = {
           id,
-          title: body.title || id,
-          expected: body.expected || '',
+          title: body.title || previous?.title || id,
+          expected: body.expected ?? previous?.expected ?? '',
           actual: '',
           note: '',
           status: 'running',
@@ -848,6 +909,16 @@ async function main() {
         if (!activeCase) {
           return send(400, { ok: false, error: 'No active test case. Call case-start first.' });
         }
+        if (closingCase) return send(409, { ok: false, error: 'Case is already ending.' });
+        if (!finalCaseStatuses.has(body.status)) {
+          return send(400, { ok: false, error: 'case-end requires --status pass|fail|blocked|skipped.' });
+        }
+        if (body.status === 'pass' && activeCase.steps.some((step) =>
+          (step.action.startsWith('assert:') && !step.ok) ||
+          (step.action === 'check' && ['fail', 'blocked'].includes(step.status)))) {
+          return send(409, { ok: false, error: 'A failed assertion or failed/blocked check prevents passing this attempt. Record its result, then retry with the same ID.' });
+        }
+        closingCase = true;
         let screenshotPath = null;
         if (body.screenshot || body.status === 'fail' || body.status === 'blocked') {
           try {
@@ -866,7 +937,7 @@ async function main() {
             });
           } catch (_) {}
         }
-        activeCase.status = body.status || 'pass';
+        activeCase.status = body.status;
         activeCase.actual = body.actual || activeCase.actual || '';
         activeCase.note = body.note || activeCase.note || '';
         activeCase.endedAt = new Date().toISOString();
@@ -880,8 +951,54 @@ async function main() {
           screenshot: screenshotPath
         };
         activeCase = null;
+        closingCase = false;
         persistSession();
         return send(200, { ok: true, case: finished });
+      }
+
+      if (route === '/check') {
+        if (!activeCase || closingCase) {
+          return send(409, { ok: false, error: 'Run case-start before recording a check.' });
+        }
+        if (!body.label || !finalCaseStatuses.has(body.status)) {
+          return send(400, { ok: false, error: 'check requires --label and --status pass|fail|blocked|skipped.' });
+        }
+        const step = {
+          time: new Date().toISOString(),
+          action: 'check',
+          label: body.label,
+          status: body.status,
+          value: body.expected || '',
+          actual: body.actual || '',
+          ok: body.status === 'pass'
+        };
+        if (body.screenshot) {
+          try {
+            step.screenshot = await takeScreenshot('check', false);
+          } catch (_) {}
+        }
+        recordStep(step);
+        return send(200, { ok: true, check: step });
+      }
+
+      if (route === '/change') {
+        const prior = session.changes.find((change) => change.id === body.id);
+        const status = body.status || prior?.status || 'pending';
+        if (!body.id || (!prior && !body.description) || !changeStatuses.has(status)) {
+          return send(400, { ok: false, error: 'change requires --id, --description for a new ID, and a valid cleanup status.' });
+        }
+        const change = {
+          id: body.id,
+          caseId: prior?.caseId || activeCase?.id || '',
+          description: body.description || prior?.description,
+          status,
+          note: body.note ?? prior?.note ?? '',
+          time: new Date().toISOString()
+        };
+        if (prior) Object.assign(prior, change);
+        else session.changes.push(change);
+        persistSession();
+        return send(200, { ok: true, change });
       }
 
       if (route === '/issue') {
@@ -907,21 +1024,22 @@ async function main() {
 
       if (route === '/report') {
         if (body.summary) session.summaryNote = body.summary;
-        session.endedAt = new Date().toISOString();
         persistSession();
-        const reportPath = writeReport(outDir, session);
-        return send(200, { ok: true, reportPath, outDir, sessionPath: path.join(outDir, 'session.json') });
+        const reportPath = writeReport(outDir, maskEvidence(session));
+        return send(200, {
+          ok: true, reportPath, outDir, rawReportPath: path.join(outDir, 'report.raw.md'),
+          sessionPath: path.join(outDir, 'session.json')
+        });
       }
 
       if (route === '/stop') {
         if (body.summary) session.summaryNote = body.summary;
         let reportPath = null;
         if (body.report !== false) {
-          session.endedAt = new Date().toISOString();
-          persistSession();
-          reportPath = writeReport(outDir, session);
+          finishSession();
+          reportPath = writeReport(outDir, maskEvidence(session));
         }
-        send(200, { ok: true, outDir, reportPath });
+        send(200, { ok: true, outDir, reportPath, rawReportPath: reportPath ? path.join(outDir, 'report.raw.md') : null });
         await shutdown(server);
         return;
       }
@@ -942,7 +1060,9 @@ async function main() {
       name: sessionName,
       startedAt: session.startedAt
     };
-    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), 'utf8');
+    const pendingFile = `${stateFile}.${process.pid}.tmp`;
+    fs.writeFileSync(pendingFile, JSON.stringify(state, null, 2), 'utf8');
+    fs.renameSync(pendingFile, stateFile);
     persistSession();
   });
 

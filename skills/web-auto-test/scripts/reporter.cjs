@@ -42,10 +42,54 @@ function toRelLink(outDir, filePath) {
   return path.relative(outDir, filePath).replace(/\\/g, '/');
 }
 
-function renderReportMarkdown(session, outDir) {
-  const cases = Array.isArray(session.cases) ? session.cases : [];
-  const issues = Array.isArray(session.issues) ? session.issues : [];
-  const orphanSteps = Array.isArray(session.orphanSteps) ? session.orphanSteps : [];
+function displayStep(step) {
+  const hidesValue = (['fill', 'type'].includes(step.action) && step.recordValue !== true) ||
+    step.action === 'assert:value';
+  if (!hidesValue || !step.value || step.value === '[已隐藏]') return step;
+  return {
+    ...step,
+    value: '[已隐藏]',
+    actual: typeof step.actual === 'string' ? step.actual.replaceAll(step.value, '[已隐藏]') : step.actual,
+    error: typeof step.error === 'string' ? step.error.replaceAll(step.value, '[已隐藏]') : step.error
+  };
+}
+
+function groupAttempts(cases) {
+  const groups = new Map();
+  for (const attempt of cases) {
+    if (!groups.has(attempt.id)) groups.set(attempt.id, []);
+    groups.get(attempt.id).push(attempt);
+  }
+  return [...groups.values()].map((attempts, index) =>
+    attempts.map((attempt, attemptIndex) => ({
+      ...attempt,
+      steps: (attempt.steps || []).map(displayStep),
+      anchor: `case-${index + 1}-attempt-${attemptIndex + 1}`
+    })));
+}
+
+function appendStepTable(lines, steps, outDir) {
+  if (!steps.length) {
+    lines.push('_无操作步骤记录_', '');
+    return;
+  }
+  lines.push('| # | 动作 | 目标 / 预期 | 实际 / 状态 | 耗时 | 截图 |');
+  lines.push('|---|---|---|---|---|---|');
+  steps.forEach((step, index) => {
+    const target = [step.label, step.target, step.value].filter(Boolean).join(' · ');
+    const status = step.status ? statusBadge(step.status) : (step.ok === false ? '❌' : '✅');
+    const result = [status, step.actual, step.error].filter(Boolean).join(' ');
+    const shot = step.screenshot ? `[查看](${toRelLink(outDir, step.screenshot)})` : '-';
+    lines.push(`| ${index + 1} | \`${escapeCell(step.action)}\` | ${escapeCell(target || '-')} | ${escapeCell(result)} | ${fmtMs(step.durationMs)} | ${shot} |`);
+  });
+  lines.push('');
+}
+
+function renderReportMarkdown(session, outDir, { raw = false } = {}) {
+  const groups = groupAttempts(session.cases || []);
+  const cases = groups.map((attempts) => attempts.at(-1));
+  const issues = session.issues || [];
+  const changes = session.changes || [];
 
   const counts = {
     total: cases.length,
@@ -74,8 +118,9 @@ function renderReportMarkdown(session, outDir) {
   lines.push(`| 入口地址 | ${escapeCell(session.baseUrl || session.lastUrl || '-')} |`);
   lines.push(`| 浏览器 / 视口 | ${escapeCell(session.browserLabel || 'Chrome')} · ${escapeCell(session.viewportLabel || '1440x900')} |`);
   lines.push(`| 开始时间 | ${escapeCell(session.startedAt || '-')} |`);
+  lines.push(`| 运行状态 | ${session.endedAt ? '已结束' : '进行中'} |`);
   lines.push(`| 总耗时 | ${totalDuration} |`);
-  lines.push(`| 用例统计 | 共 **${counts.total}** 条：✅ 通过 ${counts.pass} · ❌ 失败 ${counts.fail} · ⏸️ 阻塞 ${counts.blocked} · ⏭️ 跳过 ${counts.skipped}（通过率 ${passRate}） |`);
+  lines.push(`| 用例统计 | 共 **${counts.total}** 条：✅ 通过 ${counts.pass} · ❌ 失败 ${counts.fail} · ⏸️ 阻塞 ${counts.blocked} · ⏭️ 跳过 ${counts.skipped} · 运行中 ${counts.running}（通过率 ${passRate}） |`);
   if (issues.length > 0) {
     lines.push(`| 发现问题数 | **${issues.length}** 条 |`);
   }
@@ -90,14 +135,24 @@ function renderReportMarkdown(session, outDir) {
   if (cases.length > 0) {
     lines.push('## 2. 用例执行结果');
     lines.push('');
-    lines.push('| 用例 ID | 用例名称 | 状态 | 耗时 | 说明 |');
-    lines.push('|---|---|---|---|---|');
-    for (const c of cases) {
+    lines.push('| 用例 ID | 用例名称 | 最终状态 | 耗时 | 说明 | 执行记录 |');
+    lines.push('|---|---|---|---|---|---|');
+    groups.forEach((attempts) => {
+      const c = attempts.at(-1);
       const note = c.actual || c.note || c.expected || '-';
-      lines.push(
-        `| ${escapeCell(c.id)} | ${escapeCell(c.title)} | ${statusBadge(c.status)} | ${fmtMs(c.durationMs)} | ${escapeCell(note)} |`
-      );
-    }
+      const evidence = attempts.map((attempt, i) =>
+        `[${i + 1}. ${statusBadge(attempt.status)}](${raw ? '' : 'report.raw.md'}#${attempt.anchor})`
+      ).join(' / ');
+      lines.push(`| ${escapeCell(c.id)} | ${escapeCell(c.title)} | ${statusBadge(c.status)} | ${fmtMs(c.durationMs)} | ${escapeCell(note)} | ${evidence} |`);
+      const checks = c.steps.filter((step) => step.action === 'check' || step.label);
+      for (const step of checks) {
+        const label = escapeCell(step.label || step.action);
+        const status = statusBadge(step.status || (step.ok ? 'pass' : 'fail'));
+        const detail = [step.value && `预期 ${step.value}`, step.actual && `实际 ${step.actual}`, step.error]
+          .filter(Boolean).join(' · ');
+        lines.push(`| ↳ | ${label} | ${status} | - | ${escapeCell(detail || '-')} | - |`);
+      }
+    });
     lines.push('');
   }
 
@@ -118,7 +173,7 @@ function renderReportMarkdown(session, outDir) {
       const failShots = (c.steps || [])
         .filter((s) => s.screenshot)
         .map((s) => ({ step: s, rel: toRelLink(outDir, s.screenshot) }));
-      const lastShot = failShots.length ? failShots[failShots.length - 1] : null;
+      const lastShot = failShots.findLast(({ step }) => step.ok === false) || failShots.at(-1);
       if (lastShot) {
         lines.push(`- **现场截图**：[\`${lastShot.rel}\`](${lastShot.rel})`);
         lines.push('');
@@ -126,7 +181,7 @@ function renderReportMarkdown(session, outDir) {
       }
 
       const reproSteps = (c.steps || []).filter((s) => s.action !== 'case-screenshot');
-      if (reproSteps.length > 0) {
+      if (raw && reproSteps.length > 0) {
         lines.push('');
         lines.push('**复现步骤**：');
         reproSteps.forEach((s, idx) => {
@@ -138,7 +193,7 @@ function renderReportMarkdown(session, outDir) {
       }
 
       const diagCount = (c.consoleErrors || []).length + (c.networkErrors || []).length;
-      if (diagCount > 0) {
+      if (raw && diagCount > 0) {
         lines.push('');
         lines.push(`<details><summary>辅助诊断信息（Console 报错 ${(c.consoleErrors || []).length} 条 / 网络异常 ${(c.networkErrors || []).length} 条）</summary>`);
         lines.push('');
@@ -178,84 +233,100 @@ function renderReportMarkdown(session, outDir) {
     }
   }
 
-  // 4. Full Execution Trace
-  lines.push('## 4. 详细操作记录');
-  lines.push('');
+  if (changes.length > 0) {
+    const cleanupLabels = { pending: '待清理', restored: '已恢复', retained: '保留', irreversible: '不可恢复' };
+    lines.push('## 测试数据与遗留', '');
+    lines.push('| 记录 ID | 用例 | 变更 | 清理状态 | 备注 |');
+    lines.push('|---|---|---|---|---|');
+    for (const change of changes) {
+      const cells = [change.id, change.caseId, change.description, cleanupLabels[change.status], change.note];
+      lines.push(`| ${cells.map((cell) => escapeCell(cell || '-')).join(' | ')} |`);
+    }
+    lines.push('');
+  }
 
-  if (cases.length > 0) {
-    for (const c of cases) {
-      lines.push(`### ${c.id}：${c.title}（${statusBadge(c.status)}）`);
-      lines.push('');
-      const steps = c.steps || [];
-      if (steps.length === 0) {
-        lines.push('_无操作步骤记录_');
+  if (raw) {
+    lines.push('## 详细操作记录', '');
+    for (const attempts of groups) {
+      attempts.forEach((attempt, index) => {
+        lines.push(`<a id="${attempt.anchor}"></a>`, '');
+        lines.push(`### ${attempt.id} · ${attempt.title} · 第 ${index + 1} 次（${statusBadge(attempt.status)}）`, '');
+        if (attempt.expected) lines.push(`- 预期结果：${attempt.expected}`);
+        if (attempt.actual) lines.push(`- 实际结果：${attempt.actual}`);
+        if (attempt.note) lines.push(`- 备注：${attempt.note}`);
         lines.push('');
-        continue;
-      }
-      lines.push('| # | 动作 | 目标 / 参数 | 结果 | 耗时 | 截图 |');
-      lines.push('|---|---|---|---|---|---|');
-      steps.forEach((s, idx) => {
-        const target = [s.target, s.value ? `=> ${s.value}` : ''].filter(Boolean).join(' ');
-        const res = s.ok === false ? `❌ ${escapeCell(s.error || 'failed')}` : '✅';
-        const shot = s.screenshot
-          ? `[查看](${toRelLink(outDir, s.screenshot)})`
-          : '-';
-        lines.push(
-          `| ${idx + 1} | \`${escapeCell(s.action)}\` | ${escapeCell(target || '-')} | ${res} | ${fmtMs(s.durationMs)} | ${shot} |`
-        );
+        appendStepTable(lines, attempt.steps, outDir);
       });
-      lines.push('');
+    }
+    if (session.orphanSteps?.length) {
+      lines.push('### 通用操作轨迹（未归属具体用例）', '');
+      appendStepTable(lines, session.orphanSteps.map(displayStep), outDir);
     }
   }
 
-  if (orphanSteps.length > 0) {
-    lines.push('### 通用操作轨迹（未归属具体用例）');
-    lines.push('');
-    lines.push('| # | 动作 | 目标 / 参数 | 结果 | 耗时 | 截图 |');
-    lines.push('|---|---|---|---|---|---|');
-    orphanSteps.forEach((s, idx) => {
-      const target = [s.target, s.value ? `=> ${s.value}` : ''].filter(Boolean).join(' ');
-      const res = s.ok === false ? `❌ ${escapeCell(s.error || 'failed')}` : '✅';
-      const shot = s.screenshot ? `[查看](${toRelLink(outDir, s.screenshot)})` : '-';
-      lines.push(
-        `| ${idx + 1} | \`${escapeCell(s.action)}\` | ${escapeCell(target || '-')} | ${res} | ${fmtMs(s.durationMs)} | ${shot} |`
-      );
-    });
-    lines.push('');
+  lines.push('## 产物', '');
+  lines.push(raw ? '- [验收报告](report.md)' : '- [详细操作记录](report.raw.md)');
+  for (const source of session.sourceFiles || ['session.json']) {
+    const relative = toRelLink(outDir, source);
+    lines.push(`- [结构化执行记录 · ${relative}](${relative})`);
   }
-
-  // 5. Artifacts
-  lines.push('## 5. 产物目录');
   lines.push('');
-  lines.push(`- 测试报告：\`report.md\``);
-  lines.push(`- 原始执行记录：\`session.json\``);
-  lines.push(`- 截图目录：\`screenshots/\``);
-  lines.push('');
-
   return lines.join('\n');
 }
 
 function writeReport(outDir, session) {
   const md = renderReportMarkdown(session, outDir);
   const reportPath = path.join(outDir, 'report.md');
+  fs.writeFileSync(path.join(outDir, 'report.raw.md'), renderReportMarkdown(session, outDir, { raw: true }), 'utf8');
   fs.writeFileSync(reportPath, md, 'utf8');
   return reportPath;
 }
 
+function readReportSource(directory) {
+  const session = JSON.parse(fs.readFileSync(path.join(directory, 'session.json'), 'utf8'));
+  const withScreenshot = (entry) => entry.screenshot
+    ? { ...entry, screenshot: path.resolve(directory, entry.screenshot) }
+    : entry;
+  return {
+    ...session,
+    sourceFile: path.join(directory, 'session.json'),
+    cases: (session.cases || []).map((entry) => ({
+      ...entry, steps: (entry.steps || []).map(withScreenshot)
+    })),
+    issues: (session.issues || []).map(withScreenshot),
+    orphanSteps: (session.orphanSteps || []).map(withScreenshot)
+  };
+}
+
+function mergeReportSources(directories) {
+  const sources = [...new Set(directories.map((directory) => path.resolve(directory)))]
+    .map(readReportSource)
+    .sort((a, b) => String(a.startedAt || '').localeCompare(String(b.startedAt || '')));
+  const merged = { ...sources[0], sourceFiles: sources.map((source) => source.sourceFile) };
+  for (const field of ['cases', 'issues', 'orphanSteps']) {
+    merged[field] = sources.flatMap((source) => source[field]);
+  }
+  merged.changes = [...new Map(sources.flatMap((source) =>
+    (source.changes || []).map((change) => [change.id, change]))).values()];
+  merged.endedAt = sources.every((source) => source.endedAt)
+    ? sources.map((source) => source.endedAt).sort().at(-1)
+    : null;
+  return merged;
+}
+
 if (require.main === module) {
-  const outDir = process.argv[2];
-  if (!outDir) {
-    console.error('Usage: node reporter.cjs <outDir>');
-    process.exit(1);
+  try {
+    const [, , outDir, ...args] = process.argv;
+    if (!outDir || args.length % 2 || args.some((arg, i) => i % 2 === 0 && arg !== '--merge')) {
+      throw new Error('Usage: node reporter.cjs <outDir> [--merge <anotherRunDir>]...');
+    }
+    const session = mergeReportSources([outDir, ...args.filter((_, i) => i % 2 !== 0)]);
+    const reportPath = writeReport(outDir, session);
+    console.log(JSON.stringify({ ok: true, reportPath, rawReportPath: path.join(outDir, 'report.raw.md') }));
+  } catch (err) {
+    console.error(JSON.stringify({ ok: false, error: err.message }));
+    process.exitCode = 1;
   }
-  const sessionPath = path.join(outDir, 'session.json');
-  if (!fs.existsSync(sessionPath)) {
-    console.error(`session.json not found in ${outDir}`);
-    process.exit(1);
-  }
-  const session = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-  const reportPath = writeReport(outDir, session);
-  console.log(JSON.stringify({ ok: true, reportPath }));
 }
 
 module.exports = {

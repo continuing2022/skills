@@ -59,7 +59,7 @@ function stateFilePath(sessionId) {
   return path.join(SESSIONS_DIR, `${sanitizeSlug(sessionId, 'default')}.json`);
 }
 
-function requestDaemon(port, method, route, body) {
+function requestDaemon(port, method, route, body, timeout = 60000) {
   return new Promise((resolve, reject) => {
     const payload = body !== undefined ? JSON.stringify(body) : null;
     const req = http.request(
@@ -89,7 +89,7 @@ function requestDaemon(port, method, route, body) {
       }
     );
     req.on('error', reject);
-    req.setTimeout(60000, () => {
+    req.setTimeout(timeout, () => {
       req.destroy(new Error('Request to web-auto-test daemon timed out'));
     });
     if (payload) req.write(payload);
@@ -97,22 +97,61 @@ function requestDaemon(port, method, route, body) {
   });
 }
 
-async function loadRunningState(sessionId) {
-  const file = stateFilePath(sessionId);
-  if (!fs.existsSync(file)) return null;
+function sessionError(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
+function readSessionState(sessionId) {
   try {
-    const state = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const health = await requestDaemon(state.port, 'GET', '/health');
-    if (health.statusCode === 200 && health.data && health.data.ok) {
+    const state = JSON.parse(fs.readFileSync(stateFilePath(sessionId), 'utf8'));
+    if (!Number.isInteger(state.pid) || state.pid <= 0 ||
+        !Number.isInteger(state.port) || state.port < 1 || state.port > 65535 ||
+        typeof state.outDir !== 'string') {
+      throw new Error('Invalid PID, port, or output path');
+    }
+    return state;
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw sessionError('SESSION_INDEX_ERROR', `Cannot read session "${sessionId}": ${err.message}`);
+  }
+}
+
+function hasExited(pid) {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return err.code === 'ESRCH';
+  }
+}
+
+async function loadRunningState(sessionId) {
+  const state = readSessionState(sessionId);
+  if (!state) return null;
+
+  try {
+    const health = await requestDaemon(state.port, 'GET', '/health', undefined, 1500);
+    if (health.statusCode === 200 && health.data.ok &&
+        health.data.pid === state.pid && health.data.outDir === state.outDir) {
       return state;
     }
   } catch (_) {
-    // stale state file
+    // An inaccessible daemon may still be running outside the caller's sandbox.
   }
-  try {
-    fs.unlinkSync(file);
-  } catch (_) {}
-  return null;
+
+  if (hasExited(state.pid)) {
+    throw sessionError('SESSION_EXITED', `Session "${sessionId}" has exited. Use "forget --session ${sessionId}" before restarting.`);
+  }
+  throw sessionError('SESSION_UNREACHABLE', `Cannot reach session "${sessionId}" from this environment. Its index is preserved.`);
+}
+
+function forgetSession(sessionId) {
+  const state = readSessionState(sessionId);
+  if (state && !hasExited(state.pid)) {
+    throw sessionError('SESSION_PROCESS_PRESENT', `Session "${sessionId}" still has a process. Use "stop" from an environment that can reach it.`);
+  }
+  if (state) fs.unlinkSync(stateFilePath(sessionId));
+  printOutput({ ok: true, forgotten: Boolean(state), session: sessionId });
 }
 
 async function requireRunningState(sessionId) {
@@ -142,6 +181,7 @@ Session:
   start [--name "..."] [--mode case-driven|exploratory] [--viewport desktop|mobile|WxH]
         [--headless] [--profile default] [--cdp http://127.0.0.1:9222] [--out <dir>] [--session default]
   status [--session default]
+  forget [--session default]    Remove the index for an exited process
   stop [--summary "..."] [--no-report] [--session default]
 
 Navigation & Inspection:
@@ -154,8 +194,8 @@ Navigation & Inspection:
 
 Interactions:
   click <@ref|selector> [--screenshot [name]] [--force]
-  fill <@ref|selector> <value> [--screenshot [name]]
-  type <@ref|selector> <value> [--delay 30] [--screenshot [name]]
+  fill <@ref|selector> <value> [--record-value] [--screenshot [name]]
+  type <@ref|selector> <value> [--delay 30] [--record-value] [--screenshot [name]]
   select <@ref|selector> <value> [--screenshot [name]]
   press <key> [--target <@ref|selector>] [--screenshot [name]]
   hover <@ref|selector> [--screenshot [name]]
@@ -163,7 +203,7 @@ Interactions:
   wait [--ms 1000 | --selector <sel> | --text <txt> | --url <substr>] [--timeout 15000]
   eval "<js expression>"
 
-Assertions (exit code 2 on failure + auto failure screenshot):
+Assertions (exit code 2 on failure + auto failure screenshot, optional --label <name>):
   assert text "<expected>" [--timeout 5000]
   assert not-text "<forbidden>"
   assert url "<substring>" [--timeout 5000]
@@ -174,6 +214,8 @@ Assertions (exit code 2 on failure + auto failure screenshot):
 
 Recording & Reporting:
   case-start --id <TC-01> --title "<name>" [--expected "<expected>"]
+  check --label <name> --status <pass|fail|blocked|skipped> [--expected "..."] [--actual "..."] [--screenshot]
+  change --id <id> [--description "..."] [--status pending|restored|retained|irreversible] [--note "..."]
   case-end --status <pass|fail|blocked|skipped> [--actual "..."] [--note "..."] [--screenshot]
   issue --title "<bug>" [--severity high|medium|low] [--description "..."] [--repro "..."]
   report [--summary "..."]
@@ -287,6 +329,11 @@ async function main() {
     return;
   }
 
+  if (command === 'forget') {
+    forgetSession(sessionId);
+    return;
+  }
+
   const state = await requireRunningState(sessionId);
 
   if (command === 'status') {
@@ -370,7 +417,8 @@ async function main() {
       target,
       value,
       timeout: flags.timeout,
-      screenshot: flags.screenshot
+      screenshot: flags.screenshot,
+      recordValue: flags['record-value'] === true
     });
     printOutput(res.data);
     process.exit(res.data.ok ? 0 : 1);
@@ -385,7 +433,8 @@ async function main() {
       value,
       delay: flags.delay,
       timeout: flags.timeout,
-      screenshot: flags.screenshot
+      screenshot: flags.screenshot,
+      recordValue: flags['record-value'] === true
     });
     printOutput(res.data);
     process.exit(res.data.ok ? 0 : 1);
@@ -471,6 +520,7 @@ async function main() {
     }
     const res = await requestDaemon(state.port, 'POST', '/assert', {
       kind,
+      label: flags.label,
       target,
       expected,
       timeout: flags.timeout,
@@ -521,8 +571,23 @@ async function main() {
 
   if (command === 'case-end') {
     const res = await requestDaemon(state.port, 'POST', '/case/end', {
-      status: flags.status || args[0] || 'pass',
+      status: flags.status || args[0],
       actual: flags.actual,
+      note: flags.note,
+      screenshot: Boolean(flags.screenshot)
+    });
+    printOutput(res.data);
+    process.exit(res.data.ok ? 0 : 1);
+  }
+
+  if (command === 'check' || command === 'change') {
+    const res = await requestDaemon(state.port, 'POST', `/${command}`, {
+      id: flags.id,
+      label: flags.label,
+      status: flags.status,
+      expected: flags.expected,
+      actual: flags.actual,
+      description: flags.description,
       note: flags.note,
       screenshot: Boolean(flags.screenshot)
     });
@@ -563,6 +628,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(JSON.stringify({ ok: false, error: err && err.message ? err.message : String(err) }));
+  console.error(JSON.stringify({ ok: false, code: err.code, error: err.message || String(err) }));
   process.exit(1);
 });

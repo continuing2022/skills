@@ -165,15 +165,13 @@ async function capturePageSnapshot(page, options = {}) {
           if (inputType) entry.type = inputType;
           if (node.getAttribute('placeholder')) entry.placeholder = normalizeText(node.getAttribute('placeholder'), 60);
           if (tag === 'input' || tag === 'textarea' || tag === 'select') {
-            if (inputType === 'password') {
-              entry.value = node.value ? '***' : '';
-            } else if (inputType === 'checkbox' || inputType === 'radio') {
+            if (inputType === 'checkbox' || inputType === 'radio') {
               entry.checked = Boolean(node.checked);
             } else if (tag === 'select') {
               const selected = node.options[node.selectedIndex];
               entry.value = selected ? normalizeText(selected.text, 60) : '';
             } else {
-              entry.value = normalizeText(node.value, 60);
+              entry.hasValue = Boolean(node.value);
             }
           }
           if (tag === 'a' && node.getAttribute('href')) {
@@ -247,6 +245,7 @@ function formatSnapshotText(snap) {
     const kind = el.type ? `${el.tag}:${el.type}` : el.role;
     const parts = [`${el.ref} [${kind}]`];
     if (el.name) parts.push(`"${el.name}"`);
+    if (el.hasValue) parts.push('已填写');
     if (el.placeholder && el.placeholder !== el.name) parts.push(`placeholder="${el.placeholder}"`);
     if (el.value !== undefined && el.value !== '') parts.push(`value="${el.value}"`);
     if (el.checked !== undefined) parts.push(`checked=${el.checked}`);

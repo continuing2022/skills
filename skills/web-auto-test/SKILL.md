@@ -1,13 +1,13 @@
 ---
-name: "web-auto-test"
-description: "通用 Web AI 自动化测试工具与工作流（Playwright 持久会话 CLI + 自动记录 + Markdown 测试报告）。支持按需求/用例清单精准验收，以及给 URL 做自由探索式测试；自带持久化登录态与人机暂停接力、高危写操作确认、失败自动重试与截图留证。需要让 AI 实际打开浏览器操作测试任意 Web 页面并输出结构化测试报告时调用。"
+name: web-auto-test
+description: 当用户需要在真实浏览器中按需求或用例验收 Web 页面、探索给定 URL 中的异常，或需要扫码登录后接力测试并交付可复核的测试报告时使用。
 ---
 
 # Web AI 自动化测试（通用底座 + 项目插件）
 
 本 skill 通过「**AI 决策与校验 + Playwright 持久会话 CLI**」驱动真实浏览器完成 Web 自动化测试，并自动记录每一步操作与截图，输出 Markdown 测试报告。
 
-> **跨平台注意**：所有 CLI 命令均通过 `node <skill_dir>/scripts/webtest.cjs ...` 调用，macOS 与 Windows 通用；不要用 `./` 直接执行镜像脚本。
+> **跨平台注意**：使用 Node.js 20 或更新版本。所有 CLI 命令均通过 `node <skill_dir>/scripts/webtest.cjs ...` 调用，macOS 与 Windows 通用；不要用 `./` 直接执行镜像脚本。
 > 运行依赖 `playwright-core` 会在首次 `start` 时自动安装到 `~/.cache/web-auto-test/`（不污染当前仓库 `package.json`），默认复用本机已安装的 Chrome（无需下载大体积 Chromium）。
 
 ---
@@ -50,7 +50,7 @@ node <skill_dir>/scripts/webtest.cjs start --name "<测试名称>" --cdp http://
 # 无头模式 / 指定输出目录 / 独立账号 Profile：
 node <skill_dir>/scripts/webtest.cjs start --name "<测试名称>" --headless --profile staging --out tmp/my-report
 ```
-记录返回的 `outDir`（默认 `tmp/web-test-reports/<timestamp>-<slug>/`）。
+记录返回的 `outDir`（默认 `tmp/web-test-reports/<timestamp>-<slug>/`）。并行测试时给每个 Agent 分配独立的 `--session`、`--profile` 和 `--out`，每条命令都带对应的 `--session`。使用 CDP 时为各会话分配独立的 Chrome 实例和端口。涉及写入的用例也应分配各自的测试数据。
 
 ### 第 3 步：打开入口页 & 登录态人机接力
 ```bash
@@ -64,6 +64,8 @@ node <skill_dir>/scripts/webtest.cjs snapshot
    - 确保当前是有头可见窗口（若误开了 `--headless`，先 `stop` 再以有头模式重启）；
    - 明确告知用户：「浏览器已停在登录页，请在该窗口完成登录，完成后回复我继续。」并等待用户回复。
 2. 用户完成登录后，Profile 会自动保存登录态，先跑一次 `snapshot` 或目标页 `open` 确认已登录，再进入正式测试。
+
+账号、密码和验证码优先由用户在浏览器窗口输入。CLI 的位置参数可能出现在工具日志或进程列表。普通 `fill` 和 `type` 的值默认在测试产物里遮蔽。`--record-value` 只用于公开的测试输入。密码字段、标准账号/验证码自动填充字段和标记为 `data-webtest-private` 的元素始终遮蔽，截图也会遮住匹配的元素。分享产物前检查页面内容、截图、URL 和诊断信息中的业务数据。
 
 ### 第 4 步：执行测试循环（用例驱动 / 自由探索）
 
@@ -88,8 +90,13 @@ node <skill_dir>/scripts/webtest.cjs snapshot
    node <skill_dir>/scripts/webtest.cjs assert url "/search"
    node <skill_dir>/scripts/webtest.cjs assert visible @e12
    ```
-   - 断言通过退出码为 `0`；失败退出码为 `2`，并**自动截取失败现场图**。
-5. **标记用例结束**：
+   - 断言通过退出码为 `0`。失败退出码为 `2`，脚本会尝试截图。用 `--label "检查点名称"` 把关键断言列在验收报告中。
+   - 涉及多个预期的用例要逐项验收。可以用断言，也可以用 `check` 记录人工或自定义检查的依据。
+     ```bash
+     node <skill_dir>/scripts/webtest.cjs check --label "库存列表刷新" --status blocked \
+       --expected "切换后展示新仓库库存" --actual "当前测试仓库无商品数据" --screenshot
+     ```
+5. **标记用例结束**。结束时显式指定 `pass`、`fail`、`blocked` 或 `skipped`，并写明实际结果。存在失败断言、失败或阻塞检查点的尝试无法标为通过。数据或环境缺失用 `blocked`，用户明确排除的检查用 `skipped`。
    ```bash
    node <skill_dir>/scripts/webtest.cjs case-end --status pass --actual "成功展示 12 条结果并进入详情页" --screenshot
    ```
@@ -110,10 +117,17 @@ node <skill_dir>/scripts/webtest.cjs snapshot
 
 确认话术需写清「当前页面 URL + 即将点击的按钮/提交内容 + 可能产生的影响」，获得用户同意后再继续。
 
+用 `change` 登记测试造成的数据变更。记录安全的业务标识、影响及恢复情况。恢复操作也按其实际影响判断是否需要授权。
+```bash
+node <skill_dir>/scripts/webtest.cjs change --id warehouse-order --description "调整测试仓库顺序"
+node <skill_dir>/scripts/webtest.cjs change --id warehouse-order --status restored --note "刷新确认原顺序已恢复"
+```
+清理状态可用 `pending`（默认）、`restored`、`retained` 或 `irreversible`。
+
 ### 第 6 步：失败重试与继续策略
 - **单条用例失败**：
-  1. 自动**重试 1 次**（重新 `snapshot` 确认元素未变更，或刷新当前页重跑该用例步骤，排除偶发加载延迟）。
-  2. 重试仍失败：确认已保留失败截图，调用 `case-end --status fail --actual "<具体现象与误差>"`，然后恢复到入口页或安全状态，**继续跑完剩余用例**。
+  1. 先把该次执行用 `case-end` 关闭并记录实际失败现象。确认恢复路径安全时，用同一个用例 ID 再 `case-start` 重试一次，刷新快照并等待有意义的页面状态。所有尝试都会保留。
+  2. 提交、上传或其他有副作用的动作失败时，先检查上一次是否已生效，再决定是否重试。重试仍失败时保留失败截图，从安全状态继续其余用例。
 - **全局阻断（立即暂停并报告用户）**：
   - 登录态中途失效被踢回登录页
   - 被测服务宕机 / 端口不可达 / 整站白屏崩溃
@@ -121,16 +135,17 @@ node <skill_dir>/scripts/webtest.cjs snapshot
 ### 第 7 步：生成测试报告与收尾
 ```bash
 # 生成最终报告并关闭本次测试会话（stop 默认会自动调用 report 刷新 report.md）
-node <skill_dir>/scripts/webtest.cjs stop --summary "共执行 N 条用例，通过 X 条，失败 Y 条；核心阻塞项为……"
+node <skill_dir>/scripts/webtest.cjs stop --summary "库存列表受测试数据限制"
 ```
-若用户希望保留浏览器窗口继续人工检查，可只跑 `report` 而不跑 `stop`：
+`stop` 将尚未结束的用例登记为阻塞。需要保留浏览器窗口继续检查时，运行 `report` 生成当前进度。统计由脚本生成，摘要适合记录范围和主要发现。
 ```bash
 node <skill_dir>/scripts/webtest.cjs report --summary "..."
 ```
 最后在回复中向用户汇报：
 - 测试总览（通过/失败/阻塞数）
 - 失败用例与发现问题的精炼摘要
-- `report.md` 及关键截图的可点击文件链接
+- `report.md` 及关键截图的可点击文件链接。通过报告中的执行记录链接可打开 `report.raw.md` 查看完整步骤和复测历史。
+- 测试数据变更、清理结果和需交接的遗留项。
 
 报告结构规范见 [`references/report-template.md`](references/report-template.md)。
 
@@ -141,14 +156,14 @@ node <skill_dir>/scripts/webtest.cjs report --summary "..."
 | 分类 | 命令 | 说明 |
 |---|---|---|
 | 会话 | `start [--name --mode --viewport --headless --profile --cdp --out --session]` | 启动持久化浏览器并初始化报告目录 |
-| 会话 | `status` | 查看当前 URL、标题、活跃用例、标签页与错误计数 |
+| 会话 | `status` / `forget` | 查询为只读。退出的会话可用 `forget` 显式清理索引 |
 | 会话 | `stop [--summary "..."] [--no-report]` | 输出报告并关闭会话（CDP 模式仅断开不杀原浏览器） |
 | 导航 | `open <url> [--screenshot [name]]` | 打开 URL（可选截图） |
 | 导航 | `reload` / `back` | 刷新 / 后退 |
 | 观察 | `snapshot [--json] [--max-elements 120]` | 获取页面可见可交互元素（`@e1`…）与文本摘要 |
 | 观察 | `screenshot [name] [--full-page]` | 手动截图并记入当前用例 |
 | 交互 | `click <@ref\|sel> [--force] [--screenshot]` | 点击元素 |
-| 交互 | `fill <@ref\|sel> <value>` / `type <@ref\|sel> <value>` | 填充 / 逐字输入 |
+| 交互 | `fill <@ref\|sel> <value>` / `type <@ref\|sel> <value>` | 填充 / 逐字输入，默认遮蔽输入值 |
 | 交互 | `select <@ref\|sel> <value>` / `press <key>` / `hover <@ref\|sel>` | 下拉选择 / 按键 / 悬停 |
 | 交互 | `scroll [down\|up\|left\|right] [amount]` 或 `scroll --target <@ref\|sel>` | 滚动页面或滚动到元素 |
 | 等待 | `wait [--ms 1000 \| --selector <sel> \| --text <txt> \| --url <substr>]` | 等待条件满足 |
@@ -156,8 +171,10 @@ node <skill_dir>/scripts/webtest.cjs report --summary "..."
 | 多页签 | `tabs [list \| switch <idx> \| new [url] \| close]` | 查看/切换/新建/关闭标签页 |
 | 记录 | `case-start --id <id> --title "<name>" [--expected "..."]` | 开始记录一条用例 |
 | 记录 | `case-end --status <pass\|fail\|blocked\|skipped> [--actual --note --screenshot]` | 结束当前用例并落盘 |
+| 记录 | `check --label <name> --status <status> [--expected --actual --screenshot]` | 登记一个可独立验证的检查点 |
+| 记录 | `change --id <id> [--description --status --note]` | 登记变更或更新清理状态 |
 | 记录 | `issue --title "<bug>" [--severity high\|medium\|low] [--description --repro]` | 登记探索发现的问题（自动截图） |
-| 报告 | `report [--summary "..."]` | 渲染 `<outDir>/report.md` |
+| 报告 | `report [--summary "..."]` | 渲染 `report.md` 和 `report.raw.md` |
 
 ---
 
@@ -170,3 +187,5 @@ node <skill_dir>/scripts/webtest.cjs report --summary "..."
 | `@eN` 点击提示找不到元素 | 页面已局部重渲染导致旧引用失效，先重新执行一次 `snapshot` 获取最新 `@eN` 再点击 |
 | 点击后新开了标签页 | 守护进程会自动切换活跃页到新标签；如需切回原页，用 `tabs list` 与 `tabs switch 0` |
 | 需要同时跑两个互不干扰的测试 | 使用不同的 `--session <name>` 与 `--profile <name>` 隔离会话和登录态 |
+| `status` 返回 `SESSION_UNREACHABLE` | 回到能够连接本机后台的环境再查询。该错误会保留索引 |
+| `status` 返回 `SESSION_EXITED` | 进程已退出，可先 `forget --session <name>` 再启动。已有报告和 Profile 会保留 |

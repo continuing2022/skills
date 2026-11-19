@@ -1,28 +1,30 @@
-# 测试报告格式说明
+# 测试报告格式
 
-`scripts/reporter.cjs` 会根据每次运行自动落盘的 `session.json`，在 `<outDir>/report.md` 生成如下结构的 Markdown 测试报告：
+一次运行会生成以下文件。
 
-## 目录产物
 ```text
-tmp/web-test-reports/<YYYYMMDD-HHMMSS>-<slug>/
-├── report.md           # 可直接分享或归档的 Markdown 报告
-├── session.json        # 全量结构化执行数据（用例、步骤、截图路径、报错摘要）
-├── daemon.log          # 浏览器守护进程运行日志（排障用）
-└── screenshots/        # 按序号归档的关键节点与失败现场截图
-    ├── 001-landing.png
-    ├── 002-tc-01-pass.png
-    └── 003-tc-02-fail.png
+<outDir>/
+├── report.md       # 验收摘要、最新用例结果、检查点、问题和测试数据变更
+├── report.raw.md   # 每次执行的步骤、截图、诊断和复测历史
+├── session.json    # 结构化执行数据
+├── daemon.log      # 后台进程的运行日志
+└── screenshots/    # 关键页面和失败截图
 ```
 
-## 报告章节结构
-1. **测试概览**：模式、入口 URL、浏览器与视口、起止耗时、用例通过率统计与一句话总结。
-2. **用例执行结果**：按用例 ID 汇总状态（`✅ PASS` / `❌ FAIL` / `⏸️ BLOCKED` / `⏭️ SKIPPED`）、耗时与结论说明。
-3. **失败用例与问题详情**：前置高亮展示所有失败/阻塞用例及探索发现的 Bug，包含预期 vs 实际、复现步骤、页面 URL、嵌入式现场截图，以及折叠的辅助诊断信息（Console/Network 报错）。
-4. **详细操作记录**：按用例分节列出每一步的动作、目标/输入、执行结果、耗时及截图链接。
-5. **产物目录**：指向 `report.md`、`session.json` 与 `screenshots/`。
+## 阅读验收报告
 
-## 离线重新渲染
-如果手动补充或修订了 `session.json`，可随时离线重新生成 `report.md`：
+- 测试概览包含入口地址、浏览器、时间、运行状态及按用例 ID 计算的统计。通过率为通过数除以表中全部用例数。
+- 用例表显示每个 ID 最后一次执行的结果。执行记录列链接到每次尝试的预期、实际结果和截图。通过 `assert --label` 或 `check` 记录的检查点会显示在最终尝试下方。
+- 失败和阻塞项列出预期、实际和重点截图。探索发现的问题保留严重程度与复现步骤。
+- 测试数据与遗留列出用 `change` 记录的操作、关联用例和清理结果。如果要交接遗留数据，用备注写明影响和恢复状态。
+
+## 离线渲染与汇总复测
+
 ```bash
 node <skill_dir>/scripts/reporter.cjs "<outDir>"
+node <skill_dir>/scripts/reporter.cjs "<outDir>" --merge "<otherRunDir>"
 ```
+
+汇总同一测试任务的多段会话时可重复传入 `--merge`。使用相同的用例 ID 关联复测。报告按会话启动时间汇总，截图链接指向各自的目录；移动或分享时保留相关目录结构。离线渲染只写两份 Markdown，原始 `session.json` 完整保留在各自目录。
+
+旧会话重新渲染时会遮蔽输入步骤的值。分享前仍需检查旧 JSON、已有截图及诊断附带的敏感数据。对已生成且需要继续流转的旧报告，先重新渲染并检查产物。
