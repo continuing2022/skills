@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kuikly H5 JS Porting"
+  short_description: "Port Kuikly H5 Kotlin/JS code to h5App-js"
+  default_prompt: "Use $port-kuikly-h5app-js to migrate a Kuikly H5 Kotlin/JS component, module, prop, or utility into h5App-js."
